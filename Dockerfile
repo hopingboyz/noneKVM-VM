@@ -1,8 +1,7 @@
-FROM ubuntu:20.04
+FROM ubuntu:22.04
 
 ENV DEBIAN_FRONTEND=noninteractive
 
-# Install necessary tools
 RUN apt-get update && apt-get install -y --no-install-recommends \
     qemu-system-x86 \
     qemu-utils \
@@ -10,84 +9,89 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     genisoimage \
     novnc \
     websockify \
-    wget \
-    net-tools \
-    python3 \
+    curl \
     unzip \
+    openssh-client \
+    net-tools \
+    netcat-openbsd \
     && rm -rf /var/lib/apt/lists/*
 
-# Create working directories
 RUN mkdir -p /data /novnc /opt/qemu /cloud-init
 
-# Download Ubuntu 20.04 cloud image
-RUN wget https://cloud-images.ubuntu.com/focal/current/focal-server-cloudimg-amd64.img -O /opt/qemu/ubuntu.img
+RUN curl -L https://cloud-images.ubuntu.com/jammy/current/jammy-server-cloudimg-amd64.img \
+    -o /opt/qemu/ubuntu.img
 
-# Create cloud-init meta-data
-RUN echo 'instance-id: ubuntu-vm\nlocal-hostname: ubuntu-vm' > /cloud-init/meta-data
+RUN echo "instance-id: ubuntu-vm\nlocal-hostname: ubuntu-vm" > /cloud-init/meta-data
 
-# Create cloud-init user-data with root login enabled
-RUN cat <<EOF > /cloud-init/user-data
-#cloud-config
-users:
-  - name: root
-    lock_passwd: false
-    passwd: \$6\$gqRzOa5K\$kzNzql7/s9TehZH1DpRSe7qN6G4xQuEFv9kWRvcm54W1Yl8N5yx4tspkmnAGVK2nK3jLU5DkvZ31sH1FLaMjR1
-    shell: /bin/bash
-    sudo: ALL=(ALL) NOPASSWD:ALL
-    ssh_pwauth: true
-disable_root: false
-chpasswd:
-  expire: false
-  list: |
-    root:rootpass
-EOF
+RUN printf "#cloud-config\n\
+preserve_hostname: false\n\
+hostname: ubuntu-vm\n\
+users:\n\
+  - name: root\n\
+    gecos: root\n\
+    shell: /bin/bash\n\
+    lock_passwd: false\n\
+    passwd: \$6\$abcd1234\$W6wzBuvyE.D1mBGAgQw2uvUO/honRrnAGjFhMXSk0LUbZosYtoHy1tUtYhKlALqIldOGPrYnhSrOfAknpm91i0\n\
+    sudo: ALL=(ALL) NOPASSWD:ALL\n\
+disable_root: false\n\
+ssh_pwauth: true\n\
+chpasswd:\n\
+  list: |\n\
+    root:root\n\
+  expire: false\n\
+runcmd:\n\
+  - systemctl enable ssh\n\
+  - systemctl restart ssh\n" > /cloud-init/user-data
 
-# Create cloud-init ISO image
-RUN genisoimage -output /opt/qemu/seed.iso -volid cidata -joliet -rock /cloud-init/user-data /cloud-init/meta-data
+RUN genisoimage -output /opt/qemu/seed.iso -volid cidata -joliet -rock \
+    /cloud-init/user-data /cloud-init/meta-data
 
-# Download and setup noVNC
-RUN wget https://github.com/novnc/noVNC/archive/refs/heads/master.zip -O /tmp/novnc.zip && \
+RUN curl -L https://github.com/novnc/noVNC/archive/refs/tags/v1.3.0.zip -o /tmp/novnc.zip && \
     unzip /tmp/novnc.zip -d /tmp && \
-    mv /tmp/noVNC-master/* /novnc && \
-    rm -rf /tmp/novnc.zip /tmp/noVNC-master
+    mv /tmp/noVNC-1.3.0/* /novnc && \
+    rm -rf /tmp/novnc.zip /tmp/noVNC-1.3.0
 
-# Create startup script
 RUN cat <<'EOF' > /start.sh
 #!/bin/bash
 set -e
 
-DISK="/data/disk.qcow2"
+DISK="/data/vm.raw"
 IMG="/opt/qemu/ubuntu.img"
 SEED="/opt/qemu/seed.iso"
 
-# Create VM disk if it doesn't exist
 if [ ! -f "$DISK" ]; then
     echo "Creating VM disk..."
-    qemu-img create -f qcow2 -b "$IMG" -F qcow2 "$DISK" 20G
+    qemu-img convert -f qcow2 -O raw "$IMG" "$DISK"
+    qemu-img resize "$DISK" 50G
 fi
 
-# Start the VM
+# Start QEMU without KVM
 qemu-system-x86_64 \
+    -cpu qemu64 \
+    -smp 2 \
     -m 4096 \
-    -smp 4 \
-    -cpu max \
-    -drive file="$DISK",format=qcow2,if=virtio \
+    -drive file="$DISK",format=raw,if=virtio \
     -drive file="$SEED",format=raw,if=virtio \
     -netdev user,id=net0,hostfwd=tcp::2222-:22 \
     -device virtio-net,netdev=net0 \
     -vga virtio \
-    -nographic \
-    -vnc :0 &
+    -vnc :0 \
+    -daemonize
 
-# Start noVNC
-sleep 5
-websockify --web /novnc 6080 localhost:5900 &
+# Start noVNC on port 6080, forwarding to VNC :0 (port 5900)
+websockify --web=/novnc 6080 localhost:5900 &
 
 echo "================================================"
-echo " 🖥️  Access your VM at: http://localhost:6080"
-echo " 🔐 SSH to your VM: ssh root@localhost -p 2222"
-echo " 🧾 Username: root | Password: rootpass"
+echo " 🖥️  VNC: http://localhost:6080/vnc.html"
+echo " 🔐 SSH: ssh root@localhost -p 2222"
+echo " 🧾 Login: root / root"
 echo "================================================"
+
+for i in {1..30}; do
+  nc -z localhost 2222 && echo "✅ VM is ready!" && break
+  echo "⏳ Waiting for SSH..."
+  sleep 2
+done
 
 wait
 EOF
